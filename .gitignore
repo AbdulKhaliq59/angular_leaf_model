@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.h5
+*.ckpt
+venv/
+env/
+imageclassification/
+.ipynb_checkpoints/
