@@ -14,8 +14,9 @@ __pycache__/
 *.pyc
 *.h5
 *.ckpt
-venv/
+.venv/
 env/
+logs/
 imageclassification/
 .ipynb_checkpoints/
 >>>>>>> 8bc0e5d (Initial commit - trained model and code)
