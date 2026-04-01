@@ -1,3 +1,12 @@
+---
+title: Angular Leaf Spot Detection
+emoji: 🌿
+colorFrom: green
+colorTo: blue
+sdk: docker
+app_port: 7860
+---
+
 # Angular Leaf Spot Detection API
 
 A Flask-based REST API for detecting Angular Leaf Spot disease in plant leaves using deep learning.
