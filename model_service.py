@@ -314,7 +314,19 @@ class AngularLeafSpotModel:
             return False
         
         try:
-            self.model = tf.keras.models.load_model(self.model_path)
+            # Compatibility shim: older .h5 models store InputLayer config with
+            # 'batch_shape', which newer Keras versions don't recognise.
+            class _CompatInputLayer(tf.keras.layers.InputLayer):
+                def __init__(self, *args, **kwargs):
+                    if 'batch_shape' in kwargs:
+                        kwargs['input_shape'] = kwargs.pop('batch_shape')[1:]
+                    super().__init__(*args, **kwargs)
+
+            self.model = tf.keras.models.load_model(
+                self.model_path,
+                custom_objects={'InputLayer': _CompatInputLayer},
+                compile=False,
+            )
             self.is_loaded = True
             logger.info(f"Model loaded successfully from {self.model_path}")
             return True
