@@ -1,4 +1,5 @@
 ---
+<<<<<<< HEAD
 title: Angular Leaf Spot Detection
 emoji: 🌿
 colorFrom: green
@@ -315,3 +316,14 @@ CMD ["python", "api_server.py"]
 2. **Model Caching**: Model is loaded once and cached in memory
 3. **Batch Processing**: Use `/predict/batch` for multiple images
 4. **Image Optimization**: Resize images to 256x256 before upload for faster processing
+=======
+title: Angular Leaf Model
+emoji: 🔥
+colorFrom: purple
+colorTo: purple
+sdk: docker
+pinned: false
+---
+
+Check out the configuration reference at https://huggingface.co/docs/hub/spaces-config-reference
+>>>>>>> 7b7fc67 (initial commit)
