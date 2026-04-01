@@ -1,5 +1,5 @@
 # Core ML and Image Processing
-tensorflow==2.15.0
+tensorflow>=2.16.0
 opencv-python-headless>=4.5.0
 numpy>=1.21.0
 Pillow>=8.3.0
