@@ -256,16 +256,16 @@ def internal_error(error):
     logger.error(f"Internal server error: {error}")
     return jsonify({'error': 'Internal server error'}), 500
 
+# Load model at module level so it is available when served by gunicorn
+logger.info("Loading Angular Leaf Spot model...")
+if model_service.load_model():
+    logger.info("Model loaded successfully!")
+else:
+    logger.warning("Model failed to load. API will still start but predictions will fail.")
+
 if __name__ == '__main__':
-    # Load model on startup
     print("🌿 Angular Leaf Spot Detection API Server")
     print("=" * 50)
-    
-    print("Loading model...")
-    if model_service.load_model():
-        print("✅ Model loaded successfully!")
-    else:
-        print("⚠️ Model failed to load. API will still start but predictions will fail.")
     
     # Get port from environment or default to 5000
     port = int(os.environ.get('PORT', 5000))
