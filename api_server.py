@@ -267,8 +267,8 @@ if __name__ == '__main__':
     print("🌿 Angular Leaf Spot Detection API Server")
     print("=" * 50)
     
-    # Get port from environment or default to 5000
-    port = int(os.environ.get('PORT', 5000))
+    # Get port from environment or default to 5001
+    port = int(os.environ.get('PORT', 5001))
     debug = os.environ.get('DEBUG', 'False').lower() == 'true'
     
     print(f"🚀 Starting server on port {port}")
