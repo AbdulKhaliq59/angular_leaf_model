@@ -4,7 +4,7 @@
 # Usage: ./start_server.sh [port] [debug]
 
 # Default values
-DEFAULT_PORT=5000
+DEFAULT_PORT=5001
 DEFAULT_DEBUG=false
 
 # Get parameters

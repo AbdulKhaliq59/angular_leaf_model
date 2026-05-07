@@ -1,4 +1,10 @@
 logs/
-.venv/
+venv/
 __pycache__/
 *.pyc
+.venv/
+data/
+models/
+*.rar
+*.h5
+.DS_Store

@@ -47,14 +47,14 @@ python api_server.py
 
 **Environment Variables:**
 ```bash
-export PORT=5000        # Server port (default: 5000)
+export PORT=5001        # Server port (default: 5001)
 export DEBUG=true       # Debug mode (default: false)
 python api_server.py
 ```
 
 ### 3. Test the API
 
-The server will start at `http://localhost:5000` (or your specified port).
+The server will start at `http://localhost:5001` (or your specified port).
 
 ## API Endpoints
 
@@ -110,7 +110,7 @@ Upload a single image for prediction.
 **Example using curl:**
 ```bash
 curl -X POST \
-  http://localhost:5000/predict \
+  http://localhost:5001/predict \
   -F "image=@path/to/your/image.jpg"
 ```
 
@@ -145,7 +145,7 @@ Upload multiple images for batch prediction.
 **Example using curl:**
 ```bash
 curl -X POST \
-  http://localhost:5000/predict/batch \
+  http://localhost:5001/predict/batch \
   -F "images=@image1.jpg" \
   -F "images=@image2.jpg"
 ```
@@ -200,7 +200,7 @@ Predict an image from a URL.
 **Example using curl:**
 ```bash
 curl -X POST \
-  http://localhost:5000/predict/url \
+  http://localhost:5001/predict/url \
   -H "Content-Type: application/json" \
   -d '{"url": "https://example.com/leaf-image.jpg"}'
 ```
@@ -264,7 +264,7 @@ The API returns appropriate HTTP status codes and error messages:
 
 ### Environment Variables
 
-- `PORT`: Server port (default: 5000)
+- `PORT`: Server port (default: 5001)
 - `DEBUG`: Debug mode (default: false)
 
 ### Application Configuration
@@ -283,7 +283,7 @@ python api_server.py
 ### Production (using Gunicorn)
 ```bash
 pip install gunicorn
-gunicorn -w 4 -b 0.0.0.0:5000 api_server:app
+gunicorn -w 4 -b 0.0.0.0:5001 api_server:app
 ```
 
 ### Docker (optional)
@@ -296,7 +296,7 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY . .
-EXPOSE 5000
+EXPOSE 5001
 
 CMD ["python", "api_server.py"]
 ```
