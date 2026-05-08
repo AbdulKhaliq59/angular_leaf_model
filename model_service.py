@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """
-<<<<<<< HEAD
 Model service for Angular Leaf Spot Detection.
 
 Multi-stage validation pipeline:
@@ -13,17 +12,20 @@ predicted_class values:
   'low_quality'       : blurry or too small to analyse
   'not_leaf'          : no plant-coloured pixels detected
   'not_bean_leaf'     : leaf detected but shape/colour not consistent with bean leaves
-  'healthy'           : bean leaf, sigmoid <= HEALTHY_THRESHOLD
-  'angular_leaf_spot' : bean leaf, sigmoid >= ALS_THRESHOLD
-  'other_disease'     : bean leaf, sigmoid in uncertainty band
+  'healthy'           : bean leaf, no disease detected
+  'angular_leaf_spot' : bean leaf with angular leaf spot disease
+  'bean_rust'         : bean leaf with bean rust disease
+  'other_disease'     : low-confidence / uncertain classification
 
-Class mapping (empirically confirmed):
+Binary model class mapping (2-class sigmoid):
   Class 0 = healthy           → sigmoid output ≈ 0  (low sigmoid)
   Class 1 = angular_leaf_spot → sigmoid output ≈ 1  (high sigmoid)
-=======
-Model service for Angular Leaf Spot Detection
-Provides model loading and prediction functionality for the API server
->>>>>>> c8c3b73 (feat: Implementing Angular leaf model)
+
+Multi-class model class mapping (4-class softmax, folders sorted A-Z by Keras):
+  Class 0 = angular_leaf_spot
+  Class 1 = bean_rust
+  Class 2 = healthy
+  Class 3 = other_leaves
 """
 
 import os
@@ -35,7 +37,6 @@ from pathlib import Path
 from PIL import Image
 import logging
 
-<<<<<<< HEAD
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -291,109 +292,10 @@ class AngularLeafSpotModel:
           result          : human-readable label
           threshold       : boundary used
           interpretation  : explanation string
-=======
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-class AngularLeafSpotModel:
-    """Service class for Angular Leaf Spot detection model"""
-    
-    def __init__(self, model_path="models/beenleaf_model.h5"):
-        self.model_path = model_path
-        self.model = None
-        self.is_loaded = False
-        
-    def load_model(self):
-        """Load the trained model"""
-        if self.is_loaded:
-            return True
-            
-        if not Path(self.model_path).exists():
-            logger.error(f"Model not found at {self.model_path}")
-            return False
-        
-        try:
-            self.model = tf.keras.models.load_model(self.model_path, compile=False)
-            self.is_loaded = True
-            logger.info(f"Model loaded successfully from {self.model_path}")
-            return True
-        except Exception as e:
-            logger.error(f"Error loading model: {e}")
-            return False
-    
-    def preprocess_image(self, image_data):
-        """
-        Preprocess image data for model prediction
-        
-        Args:
-            image_data: Can be file path (str), numpy array, PIL Image, or bytes
-            
-        Returns:
-            numpy array ready for model prediction or None if error
-        """
-        try:
-            # Handle different input types
-            if isinstance(image_data, str):
-                # File path
-                if not Path(image_data).exists():
-                    logger.error(f"Image file not found: {image_data}")
-                    return None
-                img = cv2.imread(str(image_data))
-                if img is None:
-                    logger.error(f"Could not load image: {image_data}")
-                    return None
-                    
-            elif isinstance(image_data, bytes):
-                # Bytes data (from uploaded file)
-                img_array = np.frombuffer(image_data, np.uint8)
-                img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-                if img is None:
-                    logger.error("Could not decode image from bytes")
-                    return None
-                    
-            elif isinstance(image_data, Image.Image):
-                # PIL Image
-                img = cv2.cvtColor(np.array(image_data), cv2.COLOR_RGB2BGR)
-                
-            elif isinstance(image_data, np.ndarray):
-                # Already a numpy array
-                img = image_data
-                
-            else:
-                logger.error(f"Unsupported image data type: {type(image_data)}")
-                return None
-            
-            # Resize to model input size (256x256)
-            resized = tf.image.resize(img, (256, 256))
-            
-            # Normalize to 0-1 range
-            normalized = resized / 255.0
-            
-            # Add batch dimension
-            input_batch = np.expand_dims(normalized, 0)
-            
-            return input_batch
-            
-        except Exception as e:
-            logger.error(f"Error preprocessing image: {e}")
-            return None
-    
-    def predict(self, image_data):
-        """
-        Predict if leaf has angular leaf spot
-        
-        Args:
-            image_data: Image data in various formats (path, bytes, PIL Image, numpy array)
-            
-        Returns:
-            dict with prediction results or None if error
->>>>>>> c8c3b73 (feat: Implementing Angular leaf model)
         """
         if not self.is_loaded:
             if not self.load_model():
                 return None
-<<<<<<< HEAD
 
         raw_img = _get_raw_image(image_data)
 
@@ -515,24 +417,29 @@ class AngularLeafSpotModel:
 
     def _classify_multiclass(self, probs: np.ndarray) -> dict:
         """
-        Classify using the 3-class softmax model trained with:
-          Class 0 = angular_leaf_spot
-          Class 1 = healthy
-          Class 2 = other_leaves
+        Classify using the multi-class softmax model.
 
-        Folder names are sorted alphabetically by Keras, so:
-          data/angular_leaf_spot/ → index 0
-          data/healthy/           → index 1
-          data/other_leaves/      → index 2
+        Folder names are sorted alphabetically by Keras:
+          3-class model:  0=angular_leaf_spot  1=healthy        2=other_leaves
+          4-class model:  0=angular_leaf_spot  1=bean_rust      2=healthy  3=other_leaves
         """
-        CLASS_ALS        = 0
-        CLASS_HEALTHY    = 1
-        CLASS_OTHER_LEAF = 2
+        n = len(probs)
+        # Resolve class indices based on model output size
+        if n >= 4:
+            CLASS_ALS        = 0
+            CLASS_BEAN_RUST  = 1
+            CLASS_HEALTHY    = 2
+            CLASS_OTHER_LEAF = 3
+        else:
+            # 3-class fallback
+            CLASS_ALS        = 0
+            CLASS_BEAN_RUST  = None
+            CLASS_HEALTHY    = 1
+            CLASS_OTHER_LEAF = 2
 
-        predicted_idx  = int(np.argmax(probs))
-        confidence     = float(probs[predicted_idx])
+        predicted_idx = int(np.argmax(probs))
+        confidence    = float(probs[predicted_idx])
 
-        # Reject if the model is very uncertain overall
         MIN_CONFIDENCE = 0.50
         if confidence < MIN_CONFIDENCE:
             return {
@@ -558,7 +465,19 @@ class AngularLeafSpotModel:
                 'confidence':      round(confidence, 4),
                 'result':          'Angular Leaf Spot Detected',
                 'threshold':       MIN_CONFIDENCE,
-                'interpretation':  f'softmax[als]={confidence:.3f} → ALS',
+                'interpretation':  f'softmax[als]={confidence:.3f} → Angular Leaf Spot',
+            }
+
+        if CLASS_BEAN_RUST is not None and predicted_idx == CLASS_BEAN_RUST:
+            return {
+                'predicted_class': 'bean_rust',
+                'status':          'unhealthy',
+                'health_status':   'UNHEALTHY',
+                'is_leaf':         True,
+                'confidence':      round(confidence, 4),
+                'result':          'Bean Rust Detected',
+                'threshold':       MIN_CONFIDENCE,
+                'interpretation':  f'softmax[bean_rust]={confidence:.3f} → Bean Rust',
             }
 
         if predicted_idx == CLASS_HEALTHY:
@@ -573,7 +492,7 @@ class AngularLeafSpotModel:
                 'interpretation':  f'softmax[healthy]={confidence:.3f} → healthy',
             }
 
-        # CLASS_OTHER_LEAF (and any unexpected extra class)
+        # CLASS_OTHER_LEAF
         return {
             'predicted_class': 'not_bean_leaf',
             'status':          'rejected',
@@ -594,56 +513,6 @@ class AngularLeafSpotModel:
             if not self.load_model():
                 return None
 
-=======
-        
-        # Preprocess image
-        processed_image = self.preprocess_image(image_data)
-        if processed_image is None:
-            return None
-        
-        try:
-            # Make prediction
-            prediction = self.model.predict(processed_image, verbose=0)
-            confidence = float(prediction[0][0])
-            
-            # Interpret result
-            if confidence > 0.5:
-                status = "unhealthy"
-                result = "Angular Leaf Spot Detected"
-                health_status = "UNHEALTHY"
-            else:
-                status = "healthy"
-                result = "Healthy Leaf"
-                health_status = "HEALTHY"
-            
-            return {
-                'status': status,
-                'health_status': health_status,
-                'confidence': confidence,
-                'result': result,
-                'threshold': 0.5,
-                'interpretation': f">0.5 = unhealthy, ≤0.5 = healthy"
-            }
-            
-        except Exception as e:
-            logger.error(f"Error during prediction: {e}")
-            return None
-    
-    def predict_batch(self, image_data_list):
-        """
-        Predict multiple images
-        
-        Args:
-            image_data_list: List of image data in various formats
-            
-        Returns:
-            list of prediction results
-        """
-        if not self.is_loaded:
-            if not self.load_model():
-                return None
-        
->>>>>>> c8c3b73 (feat: Implementing Angular leaf model)
         results = []
         for i, image_data in enumerate(image_data_list):
             result = self.predict(image_data)
@@ -651,7 +520,6 @@ class AngularLeafSpotModel:
                 result['image_index'] = i
                 results.append(result)
             else:
-<<<<<<< HEAD
                 results.append({'image_index': i, 'error': 'Failed to process image'})
 
         return results
@@ -659,14 +527,3 @@ class AngularLeafSpotModel:
 
 # Global singleton used by the API server
 model_service = AngularLeafSpotModel()
-=======
-                results.append({
-                    'image_index': i,
-                    'error': 'Failed to process image'
-                })
-        
-        return results
-
-# Global model instance for the API
-model_service = AngularLeafSpotModel()
->>>>>>> c8c3b73 (feat: Implementing Angular leaf model)

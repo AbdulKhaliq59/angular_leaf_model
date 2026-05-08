@@ -1,317 +1,251 @@
+# Angular Leaf Spot Detection — ML Model & API
+
+A Flask REST API that detects Angular Leaf Spot (ALS) and Bean Rust on bean leaves using a MobileNetV2 transfer-learning model trained on 4 classes.
+
+## Detection Classes
+
+| Class | Meaning |
+|---|---|
+| `angular_leaf_spot` | Bean leaf with ALS disease |
+| `bean_rust` | Bean leaf with Bean Rust disease |
+| `healthy` | Healthy bean leaf |
+| `other_leaves` | Not a bean leaf (rejected) |
+
+The 4-stage inference pipeline also rejects images before they reach the model:
+- **Stage 1** — Blur / size check → `low_quality`
+- **Stage 2** — HSV leaf-colour check → `not_leaf`
+- **Stage 3** — Contour shape check → `not_bean_leaf`
+- **Stage 4** — Model inference → one of the 4 classes above
+
 ---
-title: Angular Leaf Spot Detection
-emoji: 🌿
-colorFrom: green
-colorTo: blue
-sdk: docker
-app_port: 7860
+
+## Prerequisites
+
+| Tool | Version |
+|---|---|
+| Python | **3.10 or 3.12** (3.9 crashes on Apple Silicon with TF 2.20+) |
+| pip | any recent version |
+
 ---
 
-# Angular Leaf Spot Detection API
+## Local Setup
 
-A Flask-based REST API for detecting Angular Leaf Spot disease in plant leaves using deep learning.
-
-## Overview
-
-This API provides endpoints for image classification that can detect whether a leaf image shows signs of Angular Leaf Spot disease. The model returns predictions with confidence scores and can handle single images, batch processing, and URL-based image analysis.
-
-## Quick Start
-
-### 1. Install Dependencies
+### macOS (Intel & Apple Silicon)
 
 ```bash
-# Create virtual environment (recommended)
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+# 1. Clone / navigate to this folder
+cd angular_leaf_model
 
-# Install requirements
+# 2. Create a virtual environment with the correct Python
+#    Apple Silicon (M1/M2/M3):
+/opt/homebrew/bin/python3.12 -m venv venv312
+source venv312/bin/activate
+
+#    Intel Mac (system Python 3.10+ is usually fine):
+python3 -m venv venv
+source venv/bin/activate
+
+# 3. Install dependencies
 pip install -r requirements.txt
+
+# 4. (Optional) Install datasets library for downloading training data
+pip install datasets pillow
 ```
 
-### 2. Start the Server
+### Windows
 
-**Linux/Mac:**
+```bat
+REM 1. Open Command Prompt or PowerShell and navigate to the folder
+cd angular_leaf_model
+
+REM 2. Create and activate a virtual environment
+python -m venv venv
+venv\Scripts\activate
+
+REM 3. Install dependencies
+pip install -r requirements.txt
+
+REM 4. (Optional) Install datasets library for downloading training data
+pip install datasets pillow
+```
+
+> **Windows GPU note:** If you have an NVIDIA GPU, install the CUDA-enabled wheel instead:
+> `pip install tensorflow[and-cuda]`
+
+---
+
+## Training Your Own Model
+
+### Step 1 — Prepare data folders
+
+The training script auto-detects however many class folders you create inside `data/`:
+
+```
+data/
+├── angular_leaf_spot/   ← place diseased bean leaf images here
+├── bean_rust/           ← place bean rust images here
+├── healthy/             ← place healthy bean leaf images here
+└── other_leaves/        ← place non-bean leaf images here
+```
+
+### Step 2 — Download `other_leaves` images (iNaturalist, no auth)
+
 ```bash
-./start_server.sh [port] [debug]
+# macOS / Apple Silicon
+python -u prepare_other_leaves.py --count 300
+
+# Windows
+python prepare_other_leaves.py --count 300
 ```
 
-**Windows:**
-```batch
-start_server.bat [port] [debug]
-```
+### Step 3 — Download `bean_rust` images (Hugging Face, no auth)
 
-**Direct Python:**
 ```bash
+# macOS / Apple Silicon
+python -u prepare_bean_diseases.py
+
+# Windows
+python prepare_bean_diseases.py
+```
+
+This downloads ~436 Bean Rust images from the public `beans` dataset on Hugging Face.
+
+### Step 4 — Train the model
+
+```bash
+# macOS — use the venv that has TensorFlow installed
+PYTHONUNBUFFERED=1 ./venv312/bin/python -u train_model.py
+
+# Windows
+python train_model.py
+```
+
+Training runs two stages:
+1. **Head only** (15 epochs) — MobileNetV2 base frozen
+2. **Fine-tune** (25 epochs) — top 30 layers of MobileNetV2 unfrozen
+
+The best checkpoint is saved to `models/beenleaf_model.h5` (~25 MB).
+
+Expected class layout after training (sorted alphabetically by Keras):
+
+| Index | Folder | Outcome |
+|---|---|---|
+| 0 | `angular_leaf_spot` | ALS_DETECTED |
+| 1 | `bean_rust` | NON_ALS_DISEASE |
+| 2 | `healthy` | HEALTHY_BEAN_LEAF |
+| 3 | `other_leaves` | NON_BEAN_LEAF (rejected) |
+
+---
+
+## Running the API Server
+
+```bash
+# macOS
+./venv312/bin/python api_server.py
+
+# Windows
 python api_server.py
 ```
 
-**Environment Variables:**
+The server starts at **http://localhost:5001**.
+
+### Production (Gunicorn — macOS/Linux only)
+
 ```bash
-export PORT=5001        # Server port (default: 5001)
-export DEBUG=true       # Debug mode (default: false)
-python api_server.py
+./venv312/bin/gunicorn -w 2 -b 0.0.0.0:5001 api_server:app
 ```
 
-### 3. Test the API
-
-The server will start at `http://localhost:5001` (or your specified port).
+---
 
 ## API Endpoints
 
-### Health Check
-```http
-GET /
-```
+### `GET /`  Health check
 
-Returns server status and model information.
-
-**Response:**
 ```json
 {
   "status": "healthy",
   "service": "Angular Leaf Spot Detection API",
-  "version": "1.0.0",
   "model_loaded": true
 }
 ```
 
-### Model Information
-```http
-GET /model/info
-```
+### `POST /predict`  Single image
 
-Returns detailed model information.
-
-**Response:**
-```json
-{
-  "model_path": "models/beenleaf_model.h5",
-  "model_loaded": true,
-  "input_size": [256, 256, 3],
-  "classes": ["healthy", "unhealthy"],
-  "threshold": 0.5,
-  "description": "Angular Leaf Spot Detection Model"
-}
-```
-
-### Single Image Prediction
-```http
-POST /predict
-Content-Type: multipart/form-data
-```
-
-Upload a single image for prediction.
-
-**Request:**
-- Form data with `image` field containing the image file
-- Supported formats: JPG, JPEG, PNG, GIF, BMP, TIFF, WEBP
-- Maximum file size: 16MB
-
-**Example using curl:**
 ```bash
-curl -X POST \
-  http://localhost:5001/predict \
-  -F "image=@path/to/your/image.jpg"
+curl -X POST http://localhost:5001/predict \
+  -F "image=@path/to/leaf.jpg"
 ```
 
-**Response:**
+**Success response:**
 ```json
 {
   "success": true,
   "prediction": {
-    "status": "healthy",
-    "health_status": "HEALTHY",
-    "confidence": 0.2341,
-    "result": "Healthy Leaf",
-    "threshold": 0.5,
-    "interpretation": ">0.5 = unhealthy, ≤0.5 = healthy",
-    "filename": "image.jpg",
-    "file_size": 245760
+    "predicted_class": "angular_leaf_spot",
+    "status": "unhealthy",
+    "health_status": "UNHEALTHY",
+    "is_leaf": true,
+    "confidence": 0.9741,
+    "result": "Angular Leaf Spot Detected",
+    "interpretation": "softmax[als]=0.974 → ALS"
   }
 }
 ```
 
-### Batch Image Prediction
-```http
-POST /predict/batch
-Content-Type: multipart/form-data
-```
-
-Upload multiple images for batch prediction.
-
-**Request:**
-- Form data with multiple `images` fields containing image files
-
-**Example using curl:**
-```bash
-curl -X POST \
-  http://localhost:5001/predict/batch \
-  -F "images=@image1.jpg" \
-  -F "images=@image2.jpg"
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "total_files": 2,
-  "results": [
-    {
-      "status": "healthy",
-      "health_status": "HEALTHY",
-      "confidence": 0.2341,
-      "result": "Healthy Leaf",
-      "threshold": 0.5,
-      "interpretation": ">0.5 = unhealthy, ≤0.5 = healthy",
-      "index": 0,
-      "filename": "image1.jpg",
-      "file_size": 245760
-    },
-    {
-      "status": "unhealthy",
-      "health_status": "UNHEALTHY",
-      "confidence": 0.8234,
-      "result": "Angular Leaf Spot Detected",
-      "threshold": 0.5,
-      "interpretation": ">0.5 = unhealthy, ≤0.5 = healthy",
-      "index": 1,
-      "filename": "image2.jpg",
-      "file_size": 189234
-    }
-  ]
-}
-```
-
-### URL-based Prediction
-```http
-POST /predict/url
-Content-Type: application/json
-```
-
-Predict an image from a URL.
-
-**Request:**
-```json
-{
-  "url": "https://example.com/leaf-image.jpg"
-}
-```
-
-**Example using curl:**
-```bash
-curl -X POST \
-  http://localhost:5001/predict/url \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://example.com/leaf-image.jpg"}'
-```
-
-**Response:**
+**Rejection example (blurry image):**
 ```json
 {
   "success": true,
   "prediction": {
-    "status": "healthy",
-    "health_status": "HEALTHY",
-    "confidence": 0.2341,
-    "result": "Healthy Leaf",
-    "threshold": 0.5,
-    "interpretation": ">0.5 = unhealthy, ≤0.5 = healthy",
-    "source_url": "https://example.com/leaf-image.jpg",
-    "file_size": 245760
+    "predicted_class": "low_quality",
+    "status": "rejected",
+    "health_status": "LOW_QUALITY",
+    "is_leaf": false,
+    "confidence": 0.0,
+    "result": "Low Quality Image",
+    "interpretation": "Image quality insufficient: image too blurry (score=12.3)."
   }
 }
 ```
 
-## Error Handling
+### `POST /predict/batch`  Multiple images
 
-The API returns appropriate HTTP status codes and error messages:
-
-- `400 Bad Request`: Invalid input (no file, wrong format, etc.)
-- `413 Payload Too Large`: File exceeds 16MB limit
-- `404 Not Found`: Endpoint not found
-- `405 Method Not Allowed`: Wrong HTTP method
-- `500 Internal Server Error`: Server or model errors
-
-**Error Response Format:**
-```json
-{
-  "error": "Error description"
-}
+```bash
+curl -X POST http://localhost:5001/predict/batch \
+  -F "images=@leaf1.jpg" \
+  -F "images=@leaf2.jpg"
 ```
 
-## Model Information
-
-- **Input Size**: 256x256x3 (RGB images)
-- **Classes**: `healthy`, `unhealthy`
-- **Threshold**: 0.5 (confidence > 0.5 = unhealthy)
-- **Model File**: `models/beenleaf_model.h5`
+---
 
 ## File Structure
 
 ```
-├── api_server.py           # Main Flask API server
-├── model_service.py        # Model loading and prediction logic
-├── requirements.txt        # Python dependencies
-├── start_server.sh         # Linux/Mac startup script
-├── start_server.bat        # Windows startup script
-├── README.md              # This documentation
+angular_leaf_model/
+├── api_server.py              # Flask API entry point
+├── model_service.py           # 4-stage inference pipeline
+├── train_model.py             # MobileNetV2 training script
+├── prepare_other_leaves.py    # Download other-leaf images (iNaturalist)
+├── prepare_bean_diseases.py   # Download bean-rust images (Hugging Face)
+├── requirements.txt
 ├── models/
-│   └── beenleaf_model.h5  # Trained model file
-└── data/                  # Training data (optional)
+│   └── beenleaf_model.h5      # Trained model (not in git)
+└── data/                      # Training images (not in git)
+    ├── angular_leaf_spot/
+    ├── bean_rust/
+    ├── healthy/
+    └── other_leaves/
 ```
 
-## Configuration
-
-### Environment Variables
-
-- `PORT`: Server port (default: 5001)
-- `DEBUG`: Debug mode (default: false)
-
-### Application Configuration
-
-In `api_server.py`:
-- `MAX_CONTENT_LENGTH`: Maximum file size (16MB)
-- `UPLOAD_EXTENSIONS`: Allowed file extensions
-
-## Deployment
-
-### Development
-```bash
-python api_server.py
-```
-
-### Production (using Gunicorn)
-```bash
-pip install gunicorn
-gunicorn -w 4 -b 0.0.0.0:5001 api_server:app
-```
-
-### Docker (optional)
-Create a `Dockerfile`:
-```dockerfile
-FROM python:3.9-slim
-
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-
-COPY . .
-EXPOSE 5001
-
-CMD ["python", "api_server.py"]
-```
+---
 
 ## Troubleshooting
 
-1. **Model not found**: Ensure `models/beenleaf_model.h5` exists
-2. **Import errors**: Install all requirements with `pip install -r requirements.txt`
-3. **Permission denied**: Make startup script executable with `chmod +x start_server.sh`
-4. **Port already in use**: Change port with `PORT=8080 python api_server.py`
-5. **Out of memory**: Reduce batch size or image resolution
-
-## Performance Tips
-
-1. **GPU Support**: Install `tensorflow-gpu` for faster predictions
-2. **Model Caching**: Model is loaded once and cached in memory
-3. **Batch Processing**: Use `/predict/batch` for multiple images
-4. **Image Optimization**: Resize images to 256x256 before upload for faster processing
+| Problem | Fix |
+|---|---|
+| `abort` / `mutex lock failed` on Mac | Use Python 3.12 via Homebrew: `/opt/homebrew/bin/python3.12` |
+| `ModuleNotFoundError: numpy` | Activate the venv before running: `source venv312/bin/activate` |
+| `Model not found` | Run `train_model.py` first, or place `beenleaf_model.h5` in `models/` |
+| `expected shape=(None,224,224,3)` | You're using an old model; retrain with current `train_model.py` |
+| Port 5001 already in use | `PORT=5002 python api_server.py` |
+| `iNaturalist API hanging` | Already fixed — script uses `order=desc&order_by=id` |

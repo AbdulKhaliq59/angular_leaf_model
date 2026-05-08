@@ -1,5 +1,6 @@
 logs/
 venv/
+venv312/
 __pycache__/
 *.pyc
 .venv/
@@ -8,3 +9,4 @@ models/
 *.rar
 *.h5
 .DS_Store
+*.zip
