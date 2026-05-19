@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-Download bean disease images from the 'beans' dataset (Hugging Face, no auth needed).
+Download bean leaf classes from Hugging Face ('beans' dataset).
 
-Dataset: https://huggingface.co/datasets/beans
-Classes available:
-  0 = angular_leaf_spot  → already in data/angular_leaf_spot/, skipped
-  1 = bean_rust          → saved to data/bean_rust/
-  2 = healthy            → already in data/healthy/, skipped
+Classes handled:
+  angular_leaf_spot  → data/angular_leaf_spot/   (~430 images available)
+  healthy            → data/healthy/              (~430 images available)
+
+Non-ALS disease training is handled by prepare_other_disease.py using
+soybean bacterial-blight and frogeye images — legume leaves that look
+similar to bean but with disease patterns distinct from ALS.
 
 Usage:
-  python prepare_bean_diseases.py              # downloads all bean_rust images
-  python prepare_bean_diseases.py --count 300
+  python prepare_bean_diseases.py               # download both classes
+  python prepare_bean_diseases.py --cls angular_leaf_spot
   python prepare_bean_diseases.py --overwrite
 """
 
@@ -18,109 +20,150 @@ import argparse
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from PIL import Image
 
-IMG_SIZE   = (224, 224)
-THREADS    = 8
-SAVE_DIR   = Path('data/bean_rust')
+MAX_EDGE  = 800
+MIN_EDGE  = 256
+JPEG_Q    = 95
+THREADS   = 8
+TARGET    = 1000
 
-LABEL_BEAN_RUST = 1     # label index in the 'beans' HF dataset
+BEANS_LABEL = {
+    'angular_leaf_spot': 0,
+    'healthy':           2,
+}
 
 
-def download_dataset(target: int, existing_count: int):
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _count(cls: str) -> int:
+    p = Path('data') / cls
+    return len(list(p.glob('*.jpg'))) if p.exists() else 0
+
+
+def _save(pil_img, path: Path) -> bool:
     try:
-        from datasets import load_dataset
-    except ImportError:
-        print('❌ Run: pip install datasets pillow')
-        sys.exit(1)
-
-    print('📦 Streaming beans dataset from Hugging Face …')
-    print('   (first run fetches ~50 MB — takes ~1 min on a good connection)\n')
-
-    # Combine train + validation + test splits for maximum images
-    splits = ['train', 'validation', 'test']
-    all_rust = []
-    for split in splits:
-        ds = load_dataset('beans', split=split, streaming=True)
-        for sample in ds:
-            if sample['labels'] == LABEL_BEAN_RUST:
-                all_rust.append(sample['image'])
-                if len(all_rust) + existing_count >= target:
-                    break
-        if len(all_rust) + existing_count >= target:
-            break
-
-    print(f'   Found {len(all_rust)} bean_rust images in dataset')
-    return all_rust
-
-
-def save_images(images, start_idx: int):
-    SAVE_DIR.mkdir(parents=True, exist_ok=True)
-
-    def save_one(args):
-        idx, pil_img = args
-        path = SAVE_DIR / f'bean_rust_{idx:05d}.jpg'
         if path.exists():
             return False
-        pil_img.convert('RGB').resize(IMG_SIZE).save(path, quality=90)
+        img = pil_img.convert('RGB')
+        w, h = img.size
+        if min(w, h) < MIN_EDGE:
+            return False
+        if max(w, h) > MAX_EDGE:
+            scale = MAX_EDGE / max(w, h)
+            img   = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+        img.save(path, quality=JPEG_Q)
         return True
+    except Exception:
+        return False
 
-    tasks = [(start_idx + i, img) for i, img in enumerate(images)]
+
+def _flush(pairs: list, label: str, threads: int = THREADS) -> int:
     saved = 0
-    with ThreadPoolExecutor(max_workers=THREADS) as pool:
-        futures = {pool.submit(save_one, t): t for t in tasks}
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        futures = {pool.submit(_save, img, path): path for img, path in pairs}
         done = 0
-        for future in as_completed(futures):
-            if future.result():
+        for fut in as_completed(futures):
+            if fut.result():
                 saved += 1
             done += 1
-            if done % 50 == 0 or done == len(tasks):
-                print(f'  {done}/{len(tasks)}  saved={saved}')
+            if done % 100 == 0 or done == len(pairs):
+                print(f'      [{label}] {done}/{len(pairs)}  saved={saved}')
     return saved
 
 
-def _summary():
-    print()
-    classes = ['angular_leaf_spot', 'bean_rust', 'healthy', 'other_leaves']
-    for cls in classes:
-        p = Path('data') / cls
-        n = len(list(p.glob('*'))) if p.exists() else 0
-        status = f'{n:>5} images'
-        print(f'   data/{cls:22s}  {status}')
-    print('\n▶  Run:  python train_model.py')
+def _from_beans(cls: str, needed: int, start_idx: int) -> list:
+    from datasets import load_dataset
+
+    label_id = BEANS_LABEL[cls]
+    save_dir = Path('data') / cls
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    collected = []
+    for split in ('train', 'validation', 'test'):
+        if len(collected) >= needed:
+            break
+        try:
+            ds = load_dataset('beans', split=split, streaming=True)
+            for sample in ds:
+                if sample['labels'] == label_id:
+                    idx  = start_idx + len(collected)
+                    path = save_dir / f'{cls}_{idx:05d}.jpg'
+                    collected.append((sample['image'], path))
+                    if len(collected) >= needed:
+                        break
+        except Exception as e:
+            print(f'      beans/{split} error: {e}')
+
+    return collected
+
+
+def fill_class(cls: str, target: int, overwrite: bool) -> None:
+    save_dir = Path('data') / cls
+
+    if overwrite and save_dir.exists():
+        import shutil
+        shutil.rmtree(save_dir)
+
+    existing = _count(cls)
+    needed   = target - existing
+
+    if needed <= 0:
+        print(f'  ✅ {cls}: {existing} images — already at target')
+        return
+
+    print(f'\n  📥 {cls}: {existing} existing  →  need {needed} more  (target={target})')
+    pairs = _from_beans(cls, needed, existing)
+    if pairs:
+        saved    = _flush(pairs, cls)
+        existing += saved
+        print(f'     ✔ +{saved} saved  (total={existing})')
+    else:
+        print(f'     beans returned 0 images for {cls}')
+
+    final = _count(cls)
+    icon  = '✅' if final > 0 else '⚠️ '
+    note  = ''
+    if final < target:
+        note = (f'  ⚠️  {final}/{target} — beans dataset exhausted (~430/class max).')
+    print(f'  {icon} {cls}: {final} images{note}')
+
+
+def _summary(target: int):
+    print('\n── Dataset summary ─────────────────────────────────────────────')
+    for cls in ['angular_leaf_spot', 'healthy']:
+        n   = _count(cls)
+        bar = '█' * (n // 50)
+        ok  = '✅' if n >= target else '⚠️ '
+        print(f'  {ok} {cls:22s}  {n:>5}  {bar}')
+    print('\n▶  Also run: python prepare_other_disease.py')
+    print('▶  Also run: python prepare_other_leaves.py')
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--count',     type=int, default=1000,
-                        help='Max total bean_rust images to save')
+    parser.add_argument('--count',     type=int, default=TARGET)
+    parser.add_argument('--cls',       default=None,
+                        choices=list(BEANS_LABEL.keys()))
     parser.add_argument('--overwrite', action='store_true')
     args = parser.parse_args()
 
-    existing = list(SAVE_DIR.glob('*.jpg')) if SAVE_DIR.exists() else []
-
-    if existing and not args.overwrite:
-        if len(existing) >= args.count:
-            print(f'data/bean_rust already has {len(existing)} images. Use --overwrite to re-download.')
-            _summary()
-            return
-        print(f'data/bean_rust has {len(existing)} images, collecting up to {args.count - len(existing)} more.\n')
-    elif args.overwrite and existing:
-        import shutil
-        shutil.rmtree(SAVE_DIR)
-        existing = []
-        print('Cleared data/bean_rust/\n')
-
-    images = download_dataset(args.count, len(existing))
-
-    if not images:
-        print('\n❌ No bean_rust images retrieved. Check your internet connection.')
+    try:
+        from datasets import load_dataset  # noqa: F401
+    except ImportError:
+        print('❌  pip install datasets pillow')
         sys.exit(1)
 
-    print(f'\nSaving {len(images)} images ({THREADS} threads) …\n')
-    saved = save_images(images, start_idx=len(existing))
+    classes = [args.cls] if args.cls else list(BEANS_LABEL.keys())
 
-    print(f'\n✅ Done — {saved} bean_rust images saved to data/bean_rust/')
-    _summary()
+    print('🌿 Bean leaf dataset preparation (ALS + Healthy only)')
+    print(f'   Target: {args.count} images per class')
+    print('=' * 60)
+
+    for cls in classes:
+        fill_class(cls, args.count, args.overwrite)
+
+    _summary(args.count)
 
 
 if __name__ == '__main__':

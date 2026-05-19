@@ -14,7 +14,7 @@ import tempfile
 import logging
 from pathlib import Path
 
-from model_service import model_service
+from model_service import model_service, rejection_stats
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -62,21 +62,36 @@ def health_check():
 def model_info():
     """Get model information"""
     try:
-        # Try to load model if not already loaded
         if not model_service.is_loaded:
             model_service.load_model()
-        
+
         return jsonify({
-            'model_path': model_service.model_path,
+            'model_path':   model_service.model_path,
             'model_loaded': model_service.is_loaded,
-            'input_size': [256, 256, 3],
-            'classes': ['healthy', 'unhealthy'],
-            'threshold': 0.5,
-            'description': 'Angular Leaf Spot Detection Model'
+            'input_size':   [224, 224, 3],
+            'classes':      ['angular_leaf_spot', 'healthy', 'other_disease', 'other_leaves'],
+            'n_classes':    model_service._n_classes,
+            'description':  'Angular Leaf Spot Detection Model (4-class softmax)',
         })
     except Exception as e:
         logger.error(f"Error getting model info: {e}")
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/model/stats', methods=['GET'])
+def model_stats():
+    """Return per-stage rejection counters for production monitoring."""
+    stats = rejection_stats()
+    total = stats['total']
+    reached_ml = stats['ml_predictions']
+    return jsonify({
+        'total_requests':   total,
+        'stage1_rejects':   stats['stage1_rejects'],
+        'stage2_rejects':   stats['stage2_rejects'],
+        'stage3_rejects':   stats['stage3_rejects'],
+        'ml_predictions':   reached_ml,
+        'ml_reach_rate':    round(reached_ml / total, 4) if total else None,
+    })
 
 @app.route('/predict', methods=['POST'])
 def predict_image():
@@ -275,6 +290,7 @@ if __name__ == '__main__':
     print(f"📋 Available endpoints:")
     print(f"   GET  /                - Health check")
     print(f"   GET  /model/info      - Model information")
+    print(f"   GET  /model/stats     - Per-stage rejection counters")
     print(f"   POST /predict         - Predict single image (form data)")
     print(f"   POST /predict/batch   - Predict multiple images (form data)")
     print(f"   POST /predict/url     - Predict image from URL (JSON)")

@@ -4,9 +4,9 @@ Model service for Angular Leaf Spot Detection.
 
 Multi-stage validation pipeline:
   Stage 1 — Image quality   : blur score (Laplacian) + minimum size
-  Stage 2 — Leaf presence   : HSV color analysis (green / yellow-green range)
+  Stage 2 — Leaf presence   : HSV color analysis (green / yellow-green / brown-red)
   Stage 3 — Bean-leaf shape : contour solidity + elongation ratio
-  Stage 4 — Disease class.  : ML model inference (sigmoid threshold)
+  Stage 4 — Disease class.  : ML model inference (4-class softmax)
 
 predicted_class values:
   'low_quality'       : blurry or too small to analyse
@@ -14,22 +14,21 @@ predicted_class values:
   'not_bean_leaf'     : leaf detected but shape/colour not consistent with bean leaves
   'healthy'           : bean leaf, no disease detected
   'angular_leaf_spot' : bean leaf with angular leaf spot disease
-  'bean_rust'         : bean leaf with bean rust disease
-  'other_disease'     : low-confidence / uncertain classification
-
-Binary model class mapping (2-class sigmoid):
-  Class 0 = healthy           → sigmoid output ≈ 0  (low sigmoid)
-  Class 1 = angular_leaf_spot → sigmoid output ≈ 1  (high sigmoid)
+  'other_disease'     : a disease other than ALS (non-ALS, non-bean-specific)
+  'uncertain'         : low-confidence / model cannot decide
 
 Multi-class model class mapping (4-class softmax, folders sorted A-Z by Keras):
   Class 0 = angular_leaf_spot
-  Class 1 = bean_rust
-  Class 2 = healthy
+  Class 1 = healthy
+  Class 2 = other_disease
   Class 3 = other_leaves
+
+Stage rejection counters are exposed via rejection_stats() for production monitoring.
 """
 
 import os
 import io
+import threading
 import tensorflow as tf
 import cv2
 import numpy as np
@@ -40,21 +39,44 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── Disease classification thresholds ────────────────────────────────────────
-ALS_THRESHOLD     = 0.96   # sigmoid >= this → angular_leaf_spot
-HEALTHY_THRESHOLD = 0.88   # sigmoid <= this → healthy
-# 0.88 < sigmoid < 0.96    → other_disease (uncertain band)
+# ── Multi-class softmax confidence floor ─────────────────────────────────────
+# Calibrate this against real test-set outputs after each retrain.
+# Below this value the prediction is returned as 'other_disease'.
+MIN_CONFIDENCE = 0.65
 
 # ── Stage 1 — image quality ───────────────────────────────────────────────────
 BLUR_THRESHOLD   = 60.0    # Laplacian variance; below this → low_quality
 MIN_IMAGE_PIXELS = 100     # minimum dimension (width or height) in pixels
 
 # ── Stage 2 — leaf colour detection ──────────────────────────────────────────
-LEAF_COLOR_RATIO_MIN = 0.08   # fraction of plant-coloured pixels required
+# Combined ratio of green + yellow-green + brown-red pixels.
+# Threshold kept at 8 % — widened hue ranges compensate for diseased tissue.
+LEAF_COLOR_RATIO_MIN = 0.08
 
 # ── Stage 3 — bean-leaf shape validation ─────────────────────────────────────
 BEAN_LEAF_MIN_SOLIDITY   = 0.35   # contour area / convex-hull area
 BEAN_LEAF_MAX_ELONGATION = 7.0    # long-side / short-side bounding-box ratio
+
+# ── Per-stage rejection counters (thread-safe) ───────────────────────────────
+_stats_lock = threading.Lock()
+_stats = {
+    'total':          0,
+    'stage1_rejects': 0,
+    'stage2_rejects': 0,
+    'stage3_rejects': 0,
+    'ml_predictions': 0,
+}
+
+
+def rejection_stats() -> dict:
+    """Return a snapshot of per-stage rejection counts for monitoring."""
+    with _stats_lock:
+        return dict(_stats)
+
+
+def _inc(key: str):
+    with _stats_lock:
+        _stats[key] += 1
 
 
 # ── Stage 1 helpers ───────────────────────────────────────────────────────────
@@ -86,26 +108,57 @@ def _detect_leaf(img: np.ndarray) -> tuple:
     """
     Detect whether an image contains a leaf using HSV colour analysis.
     Returns (is_leaf: bool, plant_ratio: float).
+
+    Hue ranges covered:
+      H  0–10  + H 170–180 : red-brown (ALS / bean-rust lesions, wrap-around)
+      H 10–25              : orange-brown (mid-stage ALS lesions)
+      H 25–35              : yellow-green (early disease / stressed tissue)
+      H 35–90              : green (healthy tissue)
+    Covering disease-coloured tissue prevents heavily diseased leaves from
+    being rejected as 'not_leaf' before the ML model sees them.
     """
     try:
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         total_pixels = img.shape[0] * img.shape[1]
 
-        # Green (healthy leaf): H 25-90
+        # Green (healthy tissue): H 35–90
         green_mask = cv2.inRange(
             hsv,
-            np.array([25, 25, 20]),
+            np.array([35, 25, 20]),
             np.array([90, 255, 255]),
         )
 
-        # Yellow-green / early disease: H 15-25
+        # Yellow-green / stressed / early disease: H 25–35
         yellow_green_mask = cv2.inRange(
             hsv,
-            np.array([15, 40, 20]),
+            np.array([25, 30, 20]),
+            np.array([35, 255, 255]),
+        )
+
+        # Orange-brown (mid-stage ALS / bean rust lesions): H 10–25
+        brown_mask = cv2.inRange(
+            hsv,
+            np.array([10, 40, 20]),
             np.array([25, 255, 255]),
         )
 
+        # Red (late-stage lesions, HSV hue wraps 170–180 and 0–10)
+        red_low_mask = cv2.inRange(
+            hsv,
+            np.array([0, 40, 20]),
+            np.array([10, 255, 255]),
+        )
+        red_high_mask = cv2.inRange(
+            hsv,
+            np.array([170, 40, 20]),
+            np.array([180, 255, 255]),
+        )
+
         plant_mask = cv2.bitwise_or(green_mask, yellow_green_mask)
+        plant_mask = cv2.bitwise_or(plant_mask, brown_mask)
+        plant_mask = cv2.bitwise_or(plant_mask, red_low_mask)
+        plant_mask = cv2.bitwise_or(plant_mask, red_high_mask)
+
         plant_ratio = float(cv2.countNonZero(plant_mask)) / total_pixels
 
         return plant_ratio >= LEAF_COLOR_RATIO_MIN, plant_ratio
@@ -202,7 +255,7 @@ def _get_raw_image(image_data) -> np.ndarray:
 class AngularLeafSpotModel:
     """Service class for Angular Leaf Spot detection model."""
 
-    def __init__(self, model_path="models/beenleaf_model.h5"):
+    def __init__(self, model_path="models/beenleaf_model.keras"):
         self.model_path  = model_path
         self.model       = None
         self.is_loaded   = False
@@ -269,9 +322,11 @@ class AngularLeafSpotModel:
                 logger.error(f'Unsupported image type: {type(image_data)}')
                 return None
 
-            resized    = tf.image.resize(img, (224, 224))
-            normalized = resized / 255.0
-            return np.expand_dims(normalized, 0)
+            resized = tf.image.resize(img, (224, 224))
+            # Must match train_model.py which uses mobilenet_v2.preprocess_input
+            # (scales to [-1, 1]) — do NOT divide by 255 here.
+            preprocessed = tf.keras.applications.mobilenet_v2.preprocess_input(resized)
+            return np.expand_dims(preprocessed, 0)
 
         except Exception as e:
             logger.error(f'Preprocessing error: {e}')
@@ -297,6 +352,7 @@ class AngularLeafSpotModel:
             if not self.load_model():
                 return None
 
+        _inc('total')
         raw_img = _get_raw_image(image_data)
 
         if raw_img is not None:
@@ -304,6 +360,7 @@ class AngularLeafSpotModel:
             # ── Stage 1: Image quality ────────────────────────────────────────
             is_quality_ok, quality_reason = _check_image_quality(raw_img)
             if not is_quality_ok:
+                _inc('stage1_rejects')
                 logger.info(f'Stage 1 rejected: {quality_reason}')
                 return {
                     'predicted_class': 'low_quality',
@@ -312,13 +369,14 @@ class AngularLeafSpotModel:
                     'is_leaf':         False,
                     'confidence':      0.0,
                     'result':          'Low Quality Image',
-                    'threshold':       ALS_THRESHOLD,
+                    'threshold':       MIN_CONFIDENCE,
                     'interpretation':  f'Image quality insufficient: {quality_reason}.',
                 }
 
             # ── Stage 2: Leaf colour detection ────────────────────────────────
             is_leaf, plant_ratio = _detect_leaf(raw_img)
             if not is_leaf:
+                _inc('stage2_rejects')
                 logger.info(f'Stage 2 rejected: plant_ratio={plant_ratio:.3f}')
                 return {
                     'predicted_class': 'not_leaf',
@@ -327,22 +385,23 @@ class AngularLeafSpotModel:
                     'is_leaf':         False,
                     'confidence':      round(plant_ratio, 4),
                     'result':          'Not a Leaf',
-                    'threshold':       ALS_THRESHOLD,
+                    'threshold':       MIN_CONFIDENCE,
                     'interpretation':  'Image does not appear to contain a leaf.',
                 }
 
             # ── Stage 3: Bean-leaf shape validation ───────────────────────────
             is_bean_like, shape_reason = _check_bean_leaf_shape(raw_img)
             if not is_bean_like:
+                _inc('stage3_rejects')
                 logger.info(f'Stage 3 rejected: {shape_reason}')
                 return {
                     'predicted_class': 'not_bean_leaf',
                     'status':          'rejected',
                     'health_status':   'NOT_BEAN_LEAF',
-                    'is_leaf':         True,   # a leaf was found, just not a bean leaf
+                    'is_leaf':         True,
                     'confidence':      0.0,
                     'result':          'Not a Bean Leaf',
-                    'threshold':       ALS_THRESHOLD,
+                    'threshold':       MIN_CONFIDENCE,
                     'interpretation':  (
                         f'A leaf was detected but its shape is not consistent '
                         f'with bean leaves ({shape_reason}). Only bean leaves are supported.'
@@ -353,94 +412,39 @@ class AngularLeafSpotModel:
             logger.warning('Could not decode raw image; skipping Stages 1-3.')
 
         # ── Stage 4: ML model inference ───────────────────────────────────────
+        _inc('ml_predictions')
         processed = self.preprocess_image(image_data)
         if processed is None:
             return None
 
         try:
             output = self.model.predict(processed, verbose=0)[0]
-
-            if self._is_binary:
-                return self._classify_binary(float(output[0]))
-            else:
-                return self._classify_multiclass(output)
+            return self._classify_multiclass(output)
 
         except Exception as e:
             logger.error(f'Prediction error: {e}')
             return None
 
-    def _classify_binary(self, sigmoid: float) -> dict:
-        """
-        Classify using the original 2-class binary sigmoid model.
-        Class 0 = healthy (low sigmoid), Class 1 = ALS (high sigmoid).
-        """
-        if sigmoid >= ALS_THRESHOLD:
-            return {
-                'predicted_class': 'angular_leaf_spot',
-                'status':          'unhealthy',
-                'health_status':   'UNHEALTHY',
-                'is_leaf':         True,
-                'confidence':      round(sigmoid, 4),
-                'result':          'Angular Leaf Spot Detected',
-                'threshold':       ALS_THRESHOLD,
-                'interpretation':  f'sigmoid={sigmoid:.3f} ≥ {ALS_THRESHOLD} → ALS',
-            }
-
-        if sigmoid <= HEALTHY_THRESHOLD:
-            confidence = round(1.0 - sigmoid, 4)
-            return {
-                'predicted_class': 'healthy',
-                'status':          'healthy',
-                'health_status':   'HEALTHY',
-                'is_leaf':         True,
-                'confidence':      confidence,
-                'result':          'Healthy Leaf',
-                'threshold':       ALS_THRESHOLD,
-                'interpretation':  f'sigmoid={sigmoid:.3f} ≤ {HEALTHY_THRESHOLD} → healthy',
-            }
-
-        # Uncertainty band (HEALTHY_THRESHOLD < sigmoid < ALS_THRESHOLD)
-        return {
-            'predicted_class': 'other_disease',
-            'status':          'unhealthy',
-            'health_status':   'UNHEALTHY',
-            'is_leaf':         True,
-            'confidence':      round(0.5 + abs(sigmoid - 0.525), 4),
-            'result':          'Other Leaf Condition Detected',
-            'threshold':       ALS_THRESHOLD,
-            'interpretation':  (
-                f'sigmoid={sigmoid:.3f} between '
-                f'{HEALTHY_THRESHOLD}–{ALS_THRESHOLD}'
-                ' — uncertain, possibly another disease or stress condition.'
-            ),
-        }
-
     def _classify_multiclass(self, probs: np.ndarray) -> dict:
         """
-        Classify using the multi-class softmax model.
+        Classify using the 4-class softmax model.
 
-        Folder names are sorted alphabetically by Keras:
-          3-class model:  0=angular_leaf_spot  1=healthy        2=other_leaves
-          4-class model:  0=angular_leaf_spot  1=bean_rust      2=healthy  3=other_leaves
+        Folder names sorted alphabetically by Keras:
+          Class 0 = angular_leaf_spot
+          Class 1 = healthy
+          Class 2 = other_disease
+          Class 3 = other_leaves
+
+        Calibrate MIN_CONFIDENCE against real test-set outputs after retraining.
         """
-        n = len(probs)
-        # Resolve class indices based on model output size
-        if n >= 4:
-            CLASS_ALS        = 0
-            CLASS_BEAN_RUST  = 1
-            CLASS_HEALTHY    = 2
-            CLASS_OTHER_LEAF = 3
-        else:
-            # 3-class fallback
-            CLASS_ALS        = 0
-            CLASS_BEAN_RUST  = None
-            CLASS_HEALTHY    = 1
-            CLASS_OTHER_LEAF = 2
+        CLASS_ALS          = 0
+        CLASS_HEALTHY      = 1
+        CLASS_OTHER_DISEASE = 2
+        CLASS_OTHER_LEAF   = 3
 
         predicted_idx = int(np.argmax(probs))
         confidence    = float(probs[predicted_idx])
 
-        MIN_CONFIDENCE = 0.50
         if confidence < MIN_CONFIDENCE:
             return {
                 'predicted_class': 'other_disease',
@@ -448,7 +452,7 @@ class AngularLeafSpotModel:
                 'health_status':   'UNHEALTHY',
                 'is_leaf':         True,
                 'confidence':      round(confidence, 4),
-                'result':          'Uncertain Classification',
+                'result':          'Uncertain — Possible Disease',
                 'threshold':       MIN_CONFIDENCE,
                 'interpretation':  (
                     f'Max softmax probability {confidence:.3f} < {MIN_CONFIDENCE}'
@@ -468,18 +472,6 @@ class AngularLeafSpotModel:
                 'interpretation':  f'softmax[als]={confidence:.3f} → Angular Leaf Spot',
             }
 
-        if CLASS_BEAN_RUST is not None and predicted_idx == CLASS_BEAN_RUST:
-            return {
-                'predicted_class': 'bean_rust',
-                'status':          'unhealthy',
-                'health_status':   'UNHEALTHY',
-                'is_leaf':         True,
-                'confidence':      round(confidence, 4),
-                'result':          'Bean Rust Detected',
-                'threshold':       MIN_CONFIDENCE,
-                'interpretation':  f'softmax[bean_rust]={confidence:.3f} → Bean Rust',
-            }
-
         if predicted_idx == CLASS_HEALTHY:
             return {
                 'predicted_class': 'healthy',
@@ -492,7 +484,19 @@ class AngularLeafSpotModel:
                 'interpretation':  f'softmax[healthy]={confidence:.3f} → healthy',
             }
 
-        # CLASS_OTHER_LEAF
+        if predicted_idx == CLASS_OTHER_DISEASE:
+            return {
+                'predicted_class': 'other_disease',
+                'status':          'unhealthy',
+                'health_status':   'UNHEALTHY',
+                'is_leaf':         True,
+                'confidence':      round(confidence, 4),
+                'result':          'Disease Detected (Not ALS)',
+                'threshold':       MIN_CONFIDENCE,
+                'interpretation':  f'softmax[other_disease]={confidence:.3f} → non-ALS disease',
+            }
+
+        # CLASS_OTHER_LEAF — not a bean leaf
         return {
             'predicted_class': 'not_bean_leaf',
             'status':          'rejected',

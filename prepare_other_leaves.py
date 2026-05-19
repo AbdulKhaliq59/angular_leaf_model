@@ -1,176 +1,256 @@
 #!/usr/bin/env python3
 """
-Download 'other_leaves' training images using the iNaturalist public API.
+Download non-bean leaves for the other_leaves class.
 
-- No account, no API key, no giant archive download
-- Downloads individual images in parallel (8 threads)
-- Targets common non-bean leaf plants (mango, avocado, tomato, corn …)
+Sources:
+  Cassava  → andrewkatumba/cassava_leaf_diseases_dsa_2023  (any class)
+  Mango    → AfiqN/mango-leaf-disease                       (any class)
+
+Tomato is intentionally excluded: tomato leaves are visually similar to bean
+leaves (broad, compound shape), which causes the model to confuse other_leaves
+with the healthy bean class.  Cassava and mango have clearly distinct leaf
+shapes and textures.
 
 Usage:
-  python prepare_other_leaves.py            # downloads 300 images
+  python prepare_other_leaves.py              # 300 images per crop (600 total)
   python prepare_other_leaves.py --count 400
   python prepare_other_leaves.py --overwrite
 """
 
 import argparse
 import sys
-import time
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-
 from PIL import Image
-import io
 
-SAVE_DIR     = Path('data/other_leaves')
-IMG_SIZE     = (224, 224)
-THREADS      = 8
-PER_PAGE     = 100       # iNaturalist max per page
-REQUEST_DELAY = 0.3      # polite delay between API calls (seconds)
-
-INAT_API = 'https://api.inaturalist.org/v1/observations'
-
-# Common non-bean leaf plants — diverse shapes and colours
-TAXA = [
-    'Mangifera indica',        # mango
-    'Persea americana',        # avocado
-    'Solanum lycopersicum',    # tomato
-    'Zea mays',                # corn / maize
-    'Vitis vinifera',          # grape
-    'Carica papaya',           # papaya
-    'Musa',                    # banana
-    'Citrus sinensis',         # orange
-    'Solanum tuberosum',       # potato
-    'Coffea arabica',          # coffee
-]
+SAVE_DIR = Path('data/other_leaves')
+MAX_EDGE = 800
+MIN_EDGE = 128
+JPEG_Q   = 95
+THREADS  = 8
+TARGET   = 300   # per crop source
 
 
-def _api_url(taxon: str, page: int) -> str:
-    taxon_enc = taxon.replace(' ', '+')
-    return (
-        f'{INAT_API}?taxon_name={taxon_enc}'
-        f'&quality_grade=research&photos=true'
-        f'&per_page={PER_PAGE}&page={page}'
-        f'&order=desc&order_by=id'
-    )
+def _count_prefix(prefix: str) -> int:
+    return len(list(SAVE_DIR.glob(f'{prefix}_*.jpg'))) if SAVE_DIR.exists() else 0
 
 
-def collect_image_urls(target: int) -> list[str]:
-    """Collect image URLs from iNaturalist until we have enough."""
-    import json
-    urls: list[str] = []
-    seen: set[str] = set()
-
-    for taxon in TAXA:
-        if len(urls) >= target * 2:   # collect 2× so we have spares after failures
-            break
-        try:
-            api_url = _api_url(taxon, 1)
-            req = urllib.request.Request(
-                api_url,
-                headers={'User-Agent': 'LeafLensAI-DataPrep/1.0'}
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read())
-
-            for obs in data.get('results', []):
-                for photo in obs.get('photos', []):
-                    url = photo.get('url', '')
-                    if url and url not in seen:
-                        # iNaturalist thumb URLs end with /square.jpg — use medium
-                        url = url.replace('/square.', '/medium.')
-                        seen.add(url)
-                        urls.append(url)
-
-            n = len(data.get('results', []))
-            print(f'  {taxon:30s}  {n} observations  (total URLs: {len(urls)})')
-            time.sleep(REQUEST_DELAY)
-
-        except Exception as e:
-            print(f'  {taxon}: API error — {e}')
-
-    return urls
+def _total() -> int:
+    return len(list(SAVE_DIR.glob('*.jpg'))) if SAVE_DIR.exists() else 0
 
 
-def download_one(args: tuple) -> bool:
-    """Download and resize a single image. Returns True on success."""
-    idx, url, path = args
+def _save(pil_img, path: Path) -> bool:
     try:
-        req = urllib.request.Request(
-            url, headers={'User-Agent': 'LeafLensAI-DataPrep/1.0'}
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = resp.read()
-        img = Image.open(io.BytesIO(data)).convert('RGB').resize(IMG_SIZE)
-        img.save(path, quality=90)
+        if path.exists():
+            return False
+        img  = pil_img.convert('RGB')
+        w, h = img.size
+        if min(w, h) < MIN_EDGE:
+            return False
+        if max(w, h) > MAX_EDGE:
+            scale = MAX_EDGE / max(w, h)
+            img   = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+        img.save(path, quality=JPEG_Q)
         return True
     except Exception:
         return False
 
 
+def _flush(pairs: list) -> int:
+    saved = 0
+    with ThreadPoolExecutor(max_workers=THREADS) as pool:
+        futures = {pool.submit(_save, img, path): path for img, path in pairs}
+        for fut in as_completed(futures):
+            if fut.result():
+                saved += 1
+    return saved
+
+
+# ── Source 1: Tomato from PlantVillage ───────────────────────────────────────
+
+def _from_tomato(needed: int, start_idx: int) -> list:
+    """
+    Collect tomato leaf images from Hemg/new-plant-diseases-dataset.
+    Uses ALL tomato classes (healthy + diseased) to keep the hit-rate high
+    (~14 of 38 classes = ~37 %) so we only need to scan ~800 images for 300.
+    """
+    from datasets import load_dataset
+
+    HF_REPO = 'Hemg/new-plant-diseases-dataset'
+    print(f'   [tomato] Streaming {HF_REPO} (all tomato classes) …')
+
+    try:
+        ds   = load_dataset(HF_REPO, split='train', streaming=True)
+        feat = ds.features.get('label')
+        if feat is None or not hasattr(feat, 'names'):
+            print('   [tomato] Cannot read label names — skipping.')
+            return []
+
+        # Accept ALL tomato classes so hit-rate is ~37 % instead of ~3 %
+        tomato_ids = {
+            i for i, n in enumerate(feat.names)
+            if 'tomato' in n.lower()
+        }
+        if not tomato_ids:
+            print('   [tomato] No tomato classes found — skipping.')
+            return []
+        print(f'   [tomato] {len(tomato_ids)} tomato classes found '
+              f'(hit-rate ≈ {100*len(tomato_ids)//len(feat.names)} %)')
+
+        collected, scanned = [], 0
+        for sample in ds:
+            scanned += 1
+            if scanned % 500 == 0:
+                print(f'   [tomato] scanned {scanned}  '
+                      f'collected {len(collected)}/{needed} …')
+            if sample.get('label') not in tomato_ids:
+                continue
+            idx  = start_idx + len(collected)
+            path = SAVE_DIR / f'tomato_{idx:05d}.jpg'
+            collected.append((sample['image'], path))
+            if len(collected) >= needed:
+                break
+
+        return collected
+    except Exception as e:
+        print(f'   [tomato] Error: {e}')
+        return []
+
+
+# ── Source 2: Cassava leaves ─────────────────────────────────────────────────
+
+def _from_cassava(needed: int, start_idx: int) -> list:
+    """
+    Collect cassava leaf images.
+    Takes the first `needed` images regardless of class — cassava leaves look
+    entirely different from bean leaves regardless of disease state.
+    """
+    from datasets import load_dataset
+
+    HF_REPO = 'andrewkatumba/cassava_leaf_diseases_dsa_2023'
+    print(f'   [cassava] Streaming {HF_REPO} …')
+
+    try:
+        ds = load_dataset(HF_REPO, split='train', streaming=True)
+        collected, scanned = [], 0
+        for sample in ds:
+            scanned += 1
+            if scanned % 500 == 0:
+                print(f'   [cassava] scanned {scanned}  '
+                      f'collected {len(collected)}/{needed} …')
+            img_key = next(
+                (k for k in ('image', 'img', 'photo') if k in sample), None
+            )
+            if img_key is None:
+                continue
+            idx  = start_idx + len(collected)
+            path = SAVE_DIR / f'cassava_{idx:05d}.jpg'
+            collected.append((sample[img_key], path))
+            if len(collected) >= needed:
+                break
+
+        return collected
+    except Exception as e:
+        print(f'   [cassava] Error: {e}')
+        return []
+
+
+# ── Source 3: Mango leaves ───────────────────────────────────────────────────
+
+def _from_mango(needed: int, start_idx: int) -> list:
+    """
+    Collect mango leaf images from MangoLeafBD.
+    Uses all classes — mango leaves are visually distinct from bean regardless.
+    """
+    from datasets import load_dataset
+
+    HF_REPO = 'AfiqN/mango-leaf-disease'
+    print(f'   [mango] Streaming {HF_REPO} …')
+
+    try:
+        ds = load_dataset(HF_REPO, split='train', streaming=True)
+        collected, scanned = [], 0
+        for sample in ds:
+            scanned += 1
+            if scanned % 500 == 0:
+                print(f'   [mango] scanned {scanned}  '
+                      f'collected {len(collected)}/{needed} …')
+            img_key = next(
+                (k for k in ('image', 'img', 'photo') if k in sample), None
+            )
+            if img_key is None:
+                continue
+            idx  = start_idx + len(collected)
+            path = SAVE_DIR / f'mango_{idx:05d}.jpg'
+            collected.append((sample[img_key], path))
+            if len(collected) >= needed:
+                break
+
+        return collected
+    except Exception as e:
+        print(f'   [mango] Error: {e}')
+        return []
+
+
+# ── Per-source orchestrator ───────────────────────────────────────────────────
+
+def fill_source(prefix: str, fetch_fn, target: int) -> None:
+    SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    existing = _count_prefix(prefix)
+    needed   = target - existing
+
+    if needed <= 0:
+        print(f'  ✅ {prefix}: {existing} images — already at target')
+        return
+
+    print(f'\n  📥 {prefix}: {existing} existing → need {needed} more')
+    pairs = fetch_fn(needed, existing)
+    if pairs:
+        saved = _flush(pairs)
+        print(f'     ✔ +{saved} saved  (total {existing + saved})')
+    else:
+        print(f'     ⚠️  No images returned for {prefix}')
+
+
+def _summary(target: int):
+    print('\n── Dataset summary ─────────────────────────────────────────────')
+    classes = ['angular_leaf_spot', 'healthy', 'other_disease', 'other_leaves']
+    for cls in classes:
+        p  = Path('data') / cls
+        n  = len(list(p.glob('*.jpg'))) if p.exists() else 0
+        ok = '✅' if n >= target else '⚠️ '
+        print(f'  {ok} {cls:22s}  {n:>5}')
+    print('\n▶  Run:  python train_model.py')
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--count',     type=int, default=300)
-    parser.add_argument('--overwrite', action='store_true')
+    parser.add_argument('--count',     type=int, default=TARGET,
+                        help='Target images per crop (default: 300)')
+    parser.add_argument('--overwrite', action='store_true',
+                        help='Clear existing other_leaves and re-download')
     args = parser.parse_args()
 
-    existing = list(SAVE_DIR.glob('*.jpg')) if SAVE_DIR.exists() else []
-    if existing and not args.overwrite:
-        if len(existing) >= args.count:
-            print(f'Already have {len(existing)} images — done. Use --overwrite to re-download.')
-            _summary()
-            return
-        args.count -= len(existing)
-        print(f'Have {len(existing)} images, collecting {args.count} more …')
-    elif args.overwrite and existing:
-        import shutil
-        shutil.rmtree(SAVE_DIR)
-        existing = []
-
-    SAVE_DIR.mkdir(parents=True, exist_ok=True)
-    start_idx = len(existing)
-
-    print(f'\n🌿 Collecting {args.count} other-leaf images via iNaturalist API …\n')
-    print('Fetching URLs:')
-    urls = collect_image_urls(args.count)
-
-    if not urls:
-        print('\n❌ No URLs collected — check your internet connection.')
+    try:
+        from datasets import load_dataset  # noqa: F401
+    except ImportError:
+        print('❌  pip install datasets pillow')
         sys.exit(1)
 
-    print(f'\nDownloading {min(args.count, len(urls))} images ({THREADS} threads) …\n')
+    if args.overwrite and SAVE_DIR.exists():
+        import shutil
+        shutil.rmtree(SAVE_DIR)
+        print('Cleared data/other_leaves/\n')
 
-    tasks = [
-        (start_idx + i, url, SAVE_DIR / f'inat_{start_idx + i:05d}.jpg')
-        for i, url in enumerate(urls[:args.count])
-    ]
+    print('🌿 other_leaves — cassava / mango leaves (tomato excluded)')
+    print(f'   Target: {args.count} images per crop  ({args.count * 2} total)')
+    print('=' * 60)
 
-    saved = 0
-    failed = 0
-    with ThreadPoolExecutor(max_workers=THREADS) as pool:
-        futures = {pool.submit(download_one, t): t for t in tasks}
-        for future in as_completed(futures):
-            if future.result():
-                saved += 1
-            else:
-                failed += 1
-            done = saved + failed
-            if done % 25 == 0 or done == len(tasks):
-                print(f'  {done}/{len(tasks)}  saved={saved}  failed={failed}')
+    fill_source('cassava', lambda n, s: _from_cassava(n, s), args.count)
+    fill_source('mango',   lambda n, s: _from_mango(n, s),   args.count)
 
-    print(f'\n✅ Done — {saved} images saved to {SAVE_DIR}/')
-    if failed:
-        print(f'   ({failed} URLs failed — normal for iNaturalist CDN)')
-    _summary()
-
-
-def _summary():
-    print()
-    for cls in ('angular_leaf_spot', 'healthy', 'other_leaves'):
-        p = Path('data') / cls
-        n = len(list(p.glob('*'))) if p.exists() else 0
-        print(f'   data/{cls:22s}  {n:>5} images')
-    print('\n▶  Run:  python train_model.py')
+    print(f'\n   Total other_leaves: {_total()}')
+    _summary(args.count)
 
 
 if __name__ == '__main__':
