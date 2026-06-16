@@ -28,6 +28,7 @@ import tensorflow as tf
 from tensorflow.keras import layers, models, regularizers
 from tensorflow.keras.applications import MobileNetV2
 from tensorflow.keras.callbacks import (
+    CSVLogger,
     EarlyStopping,
     ModelCheckpoint,
     ReduceLROnPlateau,
@@ -243,6 +244,44 @@ def load_datasets():
     return train_ds, val_ds, test_ds, class_names, class_weight, n_classes
 
 
+# ── Augmentation summary ──────────────────────────────────────────────────────
+
+def print_augmentation_summary():
+    """Print a human-readable summary of augmentation applied per dataset split."""
+    W = 62
+    print("\n" + "─" * W)
+    print("  📋  DATA AUGMENTATION SUMMARY")
+    print("─" * W)
+
+    splits = {
+        "TRAIN": [
+            ("RandomFlip",        "horizontal + vertical"),
+            ("RandomRotation",    "±20 % (factor=0.2)"),
+            ("RandomZoom",        "±20 % (factor=0.2)"),
+            ("RandomTranslation", "height ±10 %, width ±10 %"),
+            ("RandomBrightness",  "±10 % (factor=0.1)"),
+            ("RandomContrast",    "±10 % (factor=0.1)"),
+            ("RandomCrop",        f"90 % of {IMG_SIZE}px → {int(IMG_SIZE*0.9)}×{int(IMG_SIZE*0.9)}"),
+            ("Resizing",          f"back to {IMG_SIZE}×{IMG_SIZE}"),
+            ("Gaussian noise",    "mean=0.0, stddev=2.0 (pixel space)"),
+            ("MobileNetV2 preprocess", "scale pixels to [-1, 1]"),
+        ],
+        "VAL": [
+            ("MobileNetV2 preprocess", "scale pixels to [-1, 1]"),
+        ],
+        "TEST": [
+            ("MobileNetV2 preprocess", "scale pixels to [-1, 1]"),
+        ],
+    }
+
+    for split, steps in splits.items():
+        print(f"\n  [{split}]")
+        for i, (name, detail) in enumerate(steps, 1):
+            print(f"    {i:>2}. {name:<26}  {detail}")
+
+    print("\n" + "─" * W + "\n")
+
+
 # ── Model ─────────────────────────────────────────────────────────────────────
 
 def build_model(n_classes: int):
@@ -283,7 +322,9 @@ def build_model(n_classes: int):
     return model, base, loss
 
 
-def callbacks_for(model_path: str):
+HISTORY_PATH = 'logs/training_history.csv'
+
+def callbacks_for(model_path: str, append: bool = False):
     return [
         ModelCheckpoint(
             model_path,
@@ -306,6 +347,7 @@ def callbacks_for(model_path: str):
             min_lr=1e-7,
             verbose=1,
         ),
+        CSVLogger(HISTORY_PATH, append=append),
     ]
 
 
@@ -320,7 +362,7 @@ def train(model, base, loss, train_ds, val_ds, class_weight):
         validation_data=val_ds,
         epochs=EPOCHS_HEAD,
         class_weight=class_weight,
-        callbacks=callbacks_for(MODEL_PATH),
+        callbacks=callbacks_for(MODEL_PATH, append=False),
         verbose=1,
     )
 
@@ -338,7 +380,7 @@ def train(model, base, loss, train_ds, val_ds, class_weight):
 
     # Stage 2 callbacks: seed checkpoint with Stage 1's best val_loss so it
     # only overwrites the saved file if Stage 2 actually improves on Stage 1.
-    s2_cbs = callbacks_for(MODEL_PATH)
+    s2_cbs = callbacks_for(MODEL_PATH, append=True)
     stage1_best = min(history1.history.get('val_loss', [np.inf]))
     s2_cbs[0].best = stage1_best   # ModelCheckpoint — don't overwrite a better Stage 1 checkpoint
 
@@ -409,6 +451,8 @@ def main():
         return
 
     train_ds, val_ds, test_ds, class_names, class_weight, n_classes = load_datasets()
+
+    print_augmentation_summary()
 
     model, base, loss = build_model(n_classes)
     train(model, base, loss, train_ds, val_ds, class_weight)
